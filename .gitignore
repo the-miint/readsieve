@@ -1,0 +1,21 @@
+# Working directory: packs, indices, filtered reads, smoke-test scratch.
+tmp/
+
+# Reference packs and their artifacts, wherever they land. Data is never committed.
+*.mmi
+*.fasta
+*.fasta.gz
+*.fa
+*.fa.gz
+*.fastq
+*.fastq.gz
+*.parquet
+*.calls.tsv.gz
+manifest.parquet
+pack.tsv
+
+# align_mafft and friends litter the process CWD.
+order
+pre
+trace
+hat

@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+# readsieve -- competitive-mapping read filter. Two reference classes, target and decoy;
+# a read is removed when it clearly favours target over decoy. Nothing here knows or cares
+# what the classes mean.
+#
+#   readsieve pack   --target target.fasta --decoy decoy.fasta --out PACK
+#   readsieve filter --pack PACK --r1 R1 [--r2 R2] --out-prefix P [options]
+#
+# Run either subcommand with --help for its options. See README.md for the call, the
+# thresholds, and what each term is protecting against.
+#
+# Requires a duckdb-miint build. Set READSIEVE_DUCKDB, or leave it and the sibling
+# ../duckdb-miint/build/release/duckdb is used.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DUCKDB="${READSIEVE_DUCKDB:-${ROOT%/*}/duckdb-miint/build/release/duckdb}"
+
+die()    { echo "readsieve: $*" >&2; exit 2; }
+is_int() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -gt 0 ]; }
+is_num() { case "${1:-}" in ''|*[!0-9.]*|*.*.*) return 1 ;; esac; return 0; }
+# --threads/--max-memory are spliced into `set` statements as SQL TEXT, so a stray value
+# is either a confusing parse error or appended SQL. Thresholds travel via getenv() and an
+# explicit cast, which fails loudly on garbage, but are checked here too for a clear error.
+is_mem()  { case "${1:-}" in ''|*[!0-9A-Za-z]*) return 1 ;; esac; return 0; }
+no_quote() { case "$1" in *"'"*) return 1 ;; esac; return 0; }
+
+[ -x "$DUCKDB" ] || die "no duckdb-miint binary at $DUCKDB (set READSIEVE_DUCKDB)"
+
+usage() { sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; }
+
+# ==============================================================================
+cmd_pack() {
+    local SRC="" TABLE="" SQLSRC="" OUT="" PRESET="sr" K="" W="" THREADS=8 MAX_MEM="8GB"
+    local ID_COL="ref_id" CLASS_COL="class" SEQ_COL="sequence" LABEL_COL=""
+    local TARGET_CLASS="target" DECOY_CLASS="decoy" WHERE="true"
+    local TARGET_FA="" DECOY_FA="" LABEL_EXPR=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --target)       TARGET_FA="$2"; shift 2 ;;
+            --decoy)        DECOY_FA="$2"; shift 2 ;;
+            --source)       SRC="$2"; shift 2 ;;
+            --table)        TABLE="$2"; shift 2 ;;
+            --source-sql)   SQLSRC="$2"; shift 2 ;;
+            --out)          OUT="$2"; shift 2 ;;
+            --id-col)       ID_COL="$2"; shift 2 ;;
+            --class-col)    CLASS_COL="$2"; shift 2 ;;
+            --sequence-col) SEQ_COL="$2"; shift 2 ;;
+            --label-col)    LABEL_COL="$2"; shift 2 ;;
+            --target-class) TARGET_CLASS="$2"; shift 2 ;;
+            --decoy-class)  DECOY_CLASS="$2"; shift 2 ;;
+            --where)        WHERE="$2"; shift 2 ;;
+            --preset)       PRESET="$2"; shift 2 ;;
+            --k)            K="$2"; shift 2 ;;
+            --w)            W="$2"; shift 2 ;;
+            --threads)      THREADS="$2"; shift 2 ;;
+            --max-memory)   MAX_MEM="$2"; shift 2 ;;
+            -h|--help)      pack_help; exit 0 ;;
+            *)              die "pack: unknown argument $1" ;;
+        esac
+    done
+    [ -n "$OUT" ] || die "pack: --out is required"
+    if [ -n "$TARGET_FA" ] || [ -n "$DECOY_FA" ]; then
+        [ -n "$TARGET_FA" ] && [ -n "$DECOY_FA" ] \
+            || die "pack: --target and --decoy must be given together"
+        [ -z "$SRC$SQLSRC" ] || die "pack: --target/--decoy cannot be combined with --source/--source-sql"
+    else
+        [ -n "$SRC" ] || [ -n "$SQLSRC" ] \
+            || die "pack: give --target and --decoy (FASTA), or --source, or --source-sql"
+    fi
+    is_int "$THREADS" || die "pack: --threads must be a positive integer"
+    is_mem "$MAX_MEM" || die "pack: --max-memory must be a plain size like 8GB"
+    [ -z "$K" ] || is_int "$K" || die "pack: --k must be a positive integer"
+    [ -z "$W" ] || is_int "$W" || die "pack: --w must be a positive integer"
+    # --out is interpolated into SQL string literals (COPY targets cannot be parameterised).
+    no_quote "$OUT" || die "pack: --out may not contain a single quote"
+
+    # Build the source relation. Column and class names are identifiers/literals chosen by
+    # the caller and go in as SQL text -- this is a local tool driven by its operator, not
+    # a service, but they are still checked for quotes so a typo fails loudly.
+    local FROM
+    if [ -n "$TARGET_FA" ]; then
+        for f in "$TARGET_FA" "$DECOY_FA"; do
+            [ -r "$f" ] || die "pack: cannot read $f"
+            no_quote "$f" || die "pack: paths may not contain a single quote"
+        done
+        # The zero-SQL path. ref_id is the FASTA id; label is the first word of the
+        # description, which is the useful grouping for headers like ">acc Genus species".
+        # '|' is stripped rather than rejected because this label is DERIVED, not supplied.
+        ID_COL="ref_id"; CLASS_COL="class"; SEQ_COL="sequence"; LABEL_EXPR="label"
+        TARGET_CLASS="target"; DECOY_CLASS="decoy"
+        FROM="(select read_id as ref_id, 'target' as class, sequence1 as sequence,
+                      replace(coalesce(nullif(split_part(comment,' ',1),''),'na'),'|','_') as label
+               from read_fastx('$TARGET_FA')
+               union all
+               select read_id, 'decoy', sequence1,
+                      replace(coalesce(nullif(split_part(comment,' ',1),''),'na'),'|','_')
+               from read_fastx('$DECOY_FA'))"
+    elif [ -n "$SQLSRC" ]; then
+        FROM="($SQLSRC)"
+    elif [ -n "$TABLE" ]; then
+        [ -r "$SRC" ] || die "pack: cannot read --source $SRC"
+        no_quote "$SRC" || die "pack: --source may not contain a single quote"
+        FROM="rs_att.$TABLE"
+    else
+        [ -r "$SRC" ] || die "pack: cannot read --source $SRC"
+        no_quote "$SRC" || die "pack: --source may not contain a single quote"
+        case "$SRC" in
+            *.parquet) FROM="read_parquet('$SRC')" ;;
+            *.csv|*.tsv|*.csv.gz|*.tsv.gz) FROM="read_csv('$SRC')" ;;
+            *) die "pack: --source must be .parquet/.csv/.tsv, or pass --table for a duckdb file" ;;
+        esac
+    fi
+    for v in "$ID_COL" "$CLASS_COL" "$SEQ_COL" "$LABEL_COL" "$TARGET_CLASS" "$DECOY_CLASS" "$WHERE"; do
+        no_quote "$v" || die "pack: arguments may not contain a single quote ('$v')"
+    done
+    if [ -z "$TARGET_FA" ]; then
+        LABEL_EXPR="'na'"
+        [ -z "$LABEL_COL" ] || LABEL_EXPR="coalesce($LABEL_COL::varchar, 'na')"
+    fi
+
+    mkdir -p "$OUT"
+    echo ">>> packing: $OUT (preset=$PRESET)"
+    "$DUCKDB" -box <<SQL
+set threads=${THREADS};
+set max_memory='${MAX_MEM}';
+set variable rs_out    = '${OUT}';
+set variable rs_preset = '${PRESET}';
+set variable rs_k      = $( [ -n "$K" ] && echo "$K" || echo "NULL" );
+set variable rs_w      = $( [ -n "$W" ] && echo "$W" || echo "NULL" );
+$( [ -n "$TABLE" ] && echo "attach '${SRC}' as rs_att (read_only);" )
+
+-- The one place the caller's schema is mapped onto ours. Everything downstream sees
+-- ref_id/class/sequence/label and nothing else.
+create or replace table rs_src as
+select ${ID_COL}::varchar as ref_id,
+       case ${CLASS_COL}::varchar when '${TARGET_CLASS}' then 'target'
+                                  when '${DECOY_CLASS}'  then 'decoy'
+                                  else ${CLASS_COL}::varchar end as class,
+       ${SEQ_COL}::varchar as sequence,
+       ${LABEL_EXPR} as label
+from ${FROM}
+where (${WHERE}) and ${CLASS_COL}::varchar in ('${TARGET_CLASS}', '${DECOY_CLASS}');
+
+.read ${ROOT}/sql/pack.sql
+
+copy (select * from rs_manifest) to '${OUT}/manifest.parquet' (format parquet, compression zstd);
+copy (select * from rs_packmeta) to '${OUT}/pack.tsv' (format csv, delimiter '\t', header true);
+
+select * from rs_reject where n > 0;
+select 'rejects_total' as k, coalesce(sum(n), 0)::varchar as v from rs_reject
+union all select 'targets', (select count(*) from rs_ref where class='target')::varchar
+union all select 'decoys',  (select count(*) from rs_ref where class='decoy')::varchar;
+copy (select coalesce(sum(n), 0) from rs_reject) to '${OUT}/reject_total.txt' (format csv, header false);
+select * from rs_index;
+SQL
+
+    local bad; bad=$(cat "$OUT/reject_total.txt"); rm -f "$OUT/reject_total.txt"
+    [ "$bad" = "0" ] || die "pack: $bad reference(s) rejected -- see the table above; nothing usable was written"
+    for f in target.mmi decoy.mmi manifest.parquet pack.tsv; do
+        [ -s "$OUT/$f" ] || die "pack: $OUT/$f was not written"
+    done
+    echo ">>> pack ready: $OUT"
+    column -t -s "$(printf '\t')" "$OUT/pack.tsv"
+}
+
+pack_help() { cat <<'EOF'
+readsieve pack --target targets.fasta --decoy decoys.fasta --out PACK
+
+Build a reference pack: two minimap2 indices, a manifest, and pack.tsv recording the
+settings the indices were built with. Run once per reference set.
+
+FASTA input (the usual case -- no SQL needed):
+  --target FILE        target sequences, FASTA (.gz fine)
+  --decoy FILE         decoy sequences, FASTA (.gz fine)
+                       ids come from the FASTA ids; if a description follows the id, its
+                       first word becomes the label used in reporting
+
+Table input, if your references already live in one:
+  --source PATH        .parquet / .csv / .tsv (.gz fine), or .duckdb with --table
+  --table NAME         table inside a duckdb --source
+  --id-col NAME        unique reference id                             [ref_id]
+  --class-col NAME     column holding the class                        [class]
+  --sequence-col NAME  nucleotide sequence                             [sequence]
+  --label-col NAME     grouping label for reporting                    [none]
+  --target-class V     value in --class-col meaning "target"           [target]
+  --decoy-class V      value in --class-col meaning "decoy"            [decoy]
+  --where SQL          extra condition on the source rows              [all rows]
+  --source-sql SQL     arbitrary query instead of --source; never needed for normal use
+
+Common:
+  --out DIR            pack directory to create                        [required]
+  --preset NAME        minimap2 preset                                 [sr]
+  --k N / --w N        seeding; smaller k recovers alignments on dense, near-identical
+                       reference sets -- this, not occupancy masking, is the lever if your
+                       unmeasured rate is high (see README.md)
+  --threads N          duckdb threads                                  [8]
+  --max-memory SIZE    duckdb memory ceiling                           [8GB]
+
+Rows whose class is neither target nor decoy are ignored. Anything that would make a run
+silently wrong -- a duplicate id, a '|' in an id or label, an empty sequence, a pack with
+only one class -- is rejected and no pack is written.
+EOF
+}
+
+# ==============================================================================
+cmd_filter() {
+    local PACK="" R1="" R2="" PREFIX="" THREADS=8 MAX_MEM="12GB"
+    local MIN_IDENT="0.95" MIN_COV="0.90" MIN_MARGIN="0.20" MAX_SEC="5"
+    local TARGET_INDEX="" DECOY_INDEX="" MANIFEST="" PRESET="" KEEP_REMOVED=1
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --pack)            PACK="$2"; shift 2 ;;
+            --r1)              R1="$2"; shift 2 ;;
+            --r2)              R2="$2"; shift 2 ;;
+            --out-prefix)      PREFIX="$2"; shift 2 ;;
+            --min-identity)    MIN_IDENT="$2"; shift 2 ;;
+            --min-coverage)    MIN_COV="$2"; shift 2 ;;
+            --min-margin-frac) MIN_MARGIN="$2"; shift 2 ;;
+            --max-secondary)   MAX_SEC="$2"; shift 2 ;;
+            --target-index)    TARGET_INDEX="$2"; shift 2 ;;
+            --decoy-index)     DECOY_INDEX="$2"; shift 2 ;;
+            --manifest)        MANIFEST="$2"; shift 2 ;;
+            --preset)          PRESET="$2"; shift 2 ;;
+            --threads)         THREADS="$2"; shift 2 ;;
+            --max-memory)      MAX_MEM="$2"; shift 2 ;;
+            --no-keep-removed) KEEP_REMOVED=0; shift ;;
+            -h|--help)         filter_help; exit 0 ;;
+            *)                 die "filter: unknown argument $1" ;;
+        esac
+    done
+    [ -n "$R1" ]     || die "filter: --r1 is required"
+    [ -n "$PREFIX" ] || die "filter: --out-prefix is required"
+    [ -r "$R1" ]     || die "filter: cannot read --r1 $R1"
+    [ -z "$R2" ] || [ -r "$R2" ] || die "filter: cannot read --r2 $R2"
+    for nv in "min-identity:$MIN_IDENT" "min-coverage:$MIN_COV" "min-margin-frac:$MIN_MARGIN"; do
+        is_num "${nv#*:}" || die "filter: --${nv%%:*} must be a number (got '${nv#*:}')"
+    done
+    is_int "$MAX_SEC" || die "filter: --max-secondary must be a positive integer"
+    is_int "$THREADS" || die "filter: --threads must be a positive integer"
+    is_mem "$MAX_MEM" || die "filter: --max-memory must be a plain size like 12GB"
+    # Interpolated into COPY targets.
+    no_quote "$PREFIX" || die "filter: --out-prefix may not contain a single quote"
+
+    if [ -n "$PACK" ]; then
+        [ -d "$PACK" ] || die "filter: no such pack directory $PACK"
+        : "${TARGET_INDEX:=$PACK/target.mmi}"
+        : "${DECOY_INDEX:=$PACK/decoy.mmi}"
+        : "${MANIFEST:=$PACK/manifest.parquet}"
+        # k/w are baked into the .mmi, so an index is only usable with a preset whose k/w
+        # match. Take the preset from the pack rather than defaulting and hoping.
+        [ -n "$PRESET" ] || PRESET=$(awk -F'\t' '$1=="preset"{print $2}' "$PACK/pack.tsv" 2>/dev/null)
+    fi
+    : "${PRESET:=sr}"
+    [ -n "$TARGET_INDEX" ] && [ -n "$DECOY_INDEX" ] && [ -n "$MANIFEST" ] \
+        || die "filter: give --pack, or all of --target-index/--decoy-index/--manifest"
+    [ -r "$TARGET_INDEX" ] || die "filter: missing target index $TARGET_INDEX"
+    [ -r "$DECOY_INDEX" ]  || die "filter: missing decoy index $DECOY_INDEX"
+    [ -r "$MANIFEST" ]     || die "filter: missing manifest $MANIFEST"
+
+    mkdir -p "$(dirname "$PREFIX")" tmp
+    export RS_R1="$R1" RS_R2="$R2" RS_TARGET_INDEX="$TARGET_INDEX" RS_DECOY_INDEX="$DECOY_INDEX"
+    export RS_MANIFEST="$MANIFEST" RS_MIN_IDENT="$MIN_IDENT" RS_MIN_COV="$MIN_COV"
+    export RS_MIN_MARGIN="$MIN_MARGIN" RS_MAX_SEC="$MAX_SEC"
+
+    local READ_CALL KEPT_OUT REMOVED_OUT; local -a KEPT_FILES REMOVED_FILES
+    if [ -n "$R2" ]; then
+        READ_CALL="read_fastx(getenv('RS_R1'), sequence2 := getenv('RS_R2'))"
+        KEPT_OUT="${PREFIX}.kept_{ORIENTATION}.fastq.gz"
+        REMOVED_OUT="${PREFIX}.removed_{ORIENTATION}.fastq.gz"
+        KEPT_FILES=("${PREFIX}.kept_R1.fastq.gz" "${PREFIX}.kept_R2.fastq.gz")
+        REMOVED_FILES=("${PREFIX}.removed_R1.fastq.gz" "${PREFIX}.removed_R2.fastq.gz")
+    else
+        READ_CALL="read_fastx(getenv('RS_R1'))"
+        KEPT_OUT="${PREFIX}.kept.fastq.gz"; REMOVED_OUT="${PREFIX}.removed.fastq.gz"
+        KEPT_FILES=("${PREFIX}.kept.fastq.gz"); REMOVED_FILES=("${PREFIX}.removed.fastq.gz")
+    fi
+    # `overwrite true` is set on every FASTQ COPY, but the writer DROPS it when the path
+    # contains {ORIENTATION} -- which is mandatory for paired output (duckdb-miint#201).
+    # The expanded paths are only visible out here, so clear them from bash.
+    rm -f "${KEPT_FILES[@]}" "${REMOVED_FILES[@]}"
+
+    echo ">>> filtering: r1=$R1 ${R2:+r2=$R2 }preset=$PRESET identity>=$MIN_IDENT coverage>=$MIN_COV margin>=$MIN_MARGIN"
+
+    # ONE process does mapping, outputs, summary and self-checks. Splitting the checks out
+    # would re-map the whole sample just to re-materialise the tables.
+    "$DUCKDB" -box <<SQL
+set threads=${THREADS};
+set max_memory='${MAX_MEM}';
+set temp_directory='tmp/';
+-- read_fastx assigns sequence_index during parsing, so keeping insertion order makes the
+-- output order match the input order.
+set preserve_insertion_order=true;
+
+set variable rs_target_index   = getenv('RS_TARGET_INDEX');
+set variable rs_decoy_index    = getenv('RS_DECOY_INDEX');
+set variable rs_manifest       = getenv('RS_MANIFEST');
+set variable rs_preset         = '${PRESET}';
+set variable rs_min_identity   = getenv('RS_MIN_IDENT')::double;
+set variable rs_min_coverage   = getenv('RS_MIN_COV')::double;
+set variable rs_min_margin_frac= getenv('RS_MIN_MARGIN')::double;
+set variable rs_max_secondary  = getenv('RS_MAX_SEC')::integer;
+
+create or replace table rs_input as
+select sequence_index as pair_ix, read_id, comment, sequence1, sequence2, qual1, qual2
+from ${READ_CALL};
+
+.read ${ROOT}/sql/filter.sql
+
+-- The FASTQ writer emits only read_id, so the Illumina comment is folded back into it or
+-- it is silently dropped.
+create or replace view rs_out as
+select trim(i.read_id || ' ' || coalesce(i.comment, '')) as read_id,
+       i.sequence1, i.sequence2, i.qual1, i.qual2, c.is_positive, i.pair_ix
+from rs_input i join rs_call c using (pair_ix);
+
+copy (select read_id, sequence1, sequence2, qual1, qual2 from rs_out
+      where not is_positive order by pair_ix)
+  to '${KEPT_OUT}' (format fastq, overwrite true);
+$( [ "$KEEP_REMOVED" = "1" ] && cat <<INNER
+copy (select read_id, sequence1, sequence2, qual1, qual2 from rs_out
+      where is_positive order by pair_ix)
+  to '${REMOVED_OUT}' (format fastq, overwrite true);
+INNER
+)
+-- Every raw measurement, so thresholds can be re-swept without re-mapping.
+copy (select c.*, trim(c.read_id || ' ' || coalesce(c.comment,'')) as full_header
+      from rs_call c order by c.pair_ix)
+  to '${PREFIX}.calls.tsv.gz' (format csv, delimiter '\t', header true);
+
+create or replace table rs_summary as
+with n as (select count(*) as pairs,
+       count(*) filter (where paired) as paired_pairs,
+       count(*) filter (where is_positive) as positive_pairs,
+       count(*) filter (where reject_reason='unmapped') as unmapped,
+       count(*) filter (where reject_reason='no_target_hit') as no_target_hit,
+       count(*) filter (where reject_reason='tied_with_decoy') as tied,
+       count(*) filter (where reject_reason='decoy_won') as decoy_won,
+       count(*) filter (where reject_reason='thin_margin') as thin_margin,
+       count(*) filter (where reject_reason='below_threshold') as below_threshold,
+       count(*) filter (where r1_positive and not coalesce(r2_positive,false)) as r1_only,
+       count(*) filter (where coalesce(r2_positive,false) and not r1_positive) as r2_only,
+       count(*) filter (where r1_positive and coalesce(r2_positive,false)) as n_both,
+       count(*) filter (where is_positive and r1_decoy_score is null
+                          and r2_decoy_score is null) as pos_no_decoy
+     from rs_call),
+q as (select count(*) as mate_queries from rs_query),
+m as (select count(distinct qkey) as measured from rs_mate)
+select 'input_pairs' as metric, (select pairs::varchar from n) as value
+union all select 'paired_input', (select (paired_pairs > 0)::varchar from n)
+union all select 'mate_queries', (select mate_queries::varchar from q)
+union all select 'mates_with_any_alignment', (select measured::varchar from m)
+-- Unmeasured mates are NOT evidence of a negative; a high rate invalidates the negative
+-- calls rather than confirming them.
+union all select 'mates_unmeasured', (select (mate_queries-measured)::varchar from q,m)
+union all select 'mates_unmeasured_frac',
+    (select round((mate_queries-measured)::double/nullif(mate_queries,0),5)::varchar from q,m)
+union all select 'positive_pairs', (select positive_pairs::varchar from n)
+union all select 'positive_frac', (select round(positive_pairs::double/nullif(pairs,0),5)::varchar from n)
+-- Positives whose competitive terms were SKIPPED because no decoy aligned. Usually a
+-- large minority; report it, because for those reads the call is identity+coverage only.
+union all select 'positive_no_decoy_measured', (select pos_no_decoy::varchar from n)
+union all select 'positive_r1_only', (select r1_only::varchar from n)
+union all select 'positive_r2_only', (select r2_only::varchar from n)
+union all select 'positive_both_mates', (select n_both::varchar from n)
+union all select 'reject_unmapped', (select unmapped::varchar from n)
+union all select 'reject_no_target_hit', (select no_target_hit::varchar from n)
+union all select 'reject_tied_with_decoy', (select tied::varchar from n)
+union all select 'reject_decoy_won', (select decoy_won::varchar from n)
+union all select 'reject_thin_margin', (select thin_margin::varchar from n)
+union all select 'reject_below_threshold', (select below_threshold::varchar from n)
+-- The identity floor is quantised by read length: over L bases identity can only take
+-- (L-k)/L, so the length that quantised it is part of the result.
+union all select 'median_read_length', (select median(l)::integer from (
+        select len(sequence1) as l from rs_input where sequence1 is not null
+        union all select len(sequence2) from rs_input where sequence2 is not null))::varchar
+union all select 'threshold_min_identity', getvariable('rs_min_identity')::varchar
+union all select 'threshold_min_coverage', getvariable('rs_min_coverage')::varchar
+union all select 'threshold_min_margin_frac', getvariable('rs_min_margin_frac')::varchar
+union all select 'preset', getvariable('rs_preset');
+
+copy (select * from rs_summary) to '${PREFIX}.summary.tsv' (format csv, delimiter '\t', header true);
+copy (select * from rs_verify)  to '${PREFIX}.verify.tsv'  (format csv, delimiter '\t', header true);
+
+select * from rs_summary;
+select '--- self-checks ---';
+select * from rs_verify;
+select '--- what the removed reads matched ---';
+select * from rs_removed_labels order by pairs desc limit 15;
+
+-- Written last so the driver can read one number out of it.
+copy (select coalesce(sum(violations),0) from rs_verify)
+  to '${PREFIX}.verify_total.txt' (format csv, header false);
+SQL
+
+    echo ">>> verify"
+    local fail=0 viol; viol=$(cat "${PREFIX}.verify_total.txt")
+    printf '  self-checks: violations=%s\n' "$viol"
+    [ "$viol" = "0" ] || { echo "  FAIL: see ${PREFIX}.verify.tsv"; fail=1; }
+
+    # Counted from the WRITTEN files, so this catches a truncated or unwritten output,
+    # which the SQL cannot see.
+    local want_kept want_removed got
+    want_kept=$(awk -F'\t' '$1=="input_pairs"{i=$2} $1=="positive_pairs"{p=$2} END{print i-p}' "${PREFIX}.summary.tsv")
+    want_removed=$(awk -F'\t' '$1=="positive_pairs"{print $2}' "${PREFIX}.summary.tsv")
+    for f in "${KEPT_FILES[@]}"; do
+        got=$(( $(zcat "$f" | wc -l) / 4 ))
+        printf '  %-40s records=%s want=%s\n' "$(basename "$f")" "$got" "$want_kept"
+        [ "$got" = "$want_kept" ] || { echo "  FAIL: $f != kept verdicts"; fail=1; }
+    done
+    if [ "$KEEP_REMOVED" = "1" ]; then
+        for f in "${REMOVED_FILES[@]}"; do
+            got=$(( $(zcat "$f" | wc -l) / 4 ))
+            printf '  %-40s records=%s want=%s\n' "$(basename "$f")" "$got" "$want_removed"
+            [ "$got" = "$want_removed" ] || { echo "  FAIL: $f != positive verdicts"; fail=1; }
+        done
+    fi
+    [ "$fail" = "0" ] || exit 1
+    echo "READSIEVE_FILTER_OK"
+}
+
+filter_help() { cat <<'EOF'
+readsieve filter --pack PACK --r1 R1 [--r2 R2] --out-prefix P
+
+Remove read pairs that competitively favour the pack's target class over its decoy class.
+Either mate positive drops the pair.
+
+  --pack DIR           pack from `readsieve pack`; supplies both indices, the
+                       manifest, and the preset the indices were built with
+  --r1 / --r2 PATH     input FASTQ (gz ok); omit --r2 for single-end
+  --out-prefix P       output prefix                                   [required]
+  --min-identity F     identity floor for the winning target hit       [0.95]
+  --min-coverage F     query-coverage floor for that hit               [0.90]
+  --min-margin-frac F  how far ahead of the best decoy the target must score, as a
+                       FRACTION of the target score (relative, because minimap2's
+                       score scales with read length)                  [0.20]
+  --max-secondary N    secondary alignments kept per query per class   [5]
+  --target-index / --decoy-index / --manifest / --preset   override pack contents
+  --threads N / --max-memory SIZE                          [8] [12GB]
+
+There is deliberately no occupancy-mask (minimap2 -f) option: it was swept and changes
+nothing on this workload. If your unmeasured rate is high, rebuild the pack with a smaller
+--k (see README.md).
+  --no-keep-removed    do not write the removed reads (written by default: a filter
+                       you cannot audit is a filter you cannot trust)
+
+Outputs, given --out-prefix P:
+  P.kept[_R1/_R2].fastq.gz      reads that survive
+  P.removed[_R1/_R2].fastq.gz   reads removed
+  P.calls.tsv.gz                per-pair verdict AND every raw measurement
+  P.summary.tsv                 the numbers, also printed
+  P.verify.tsv                  self-checks, PASS/FAIL per row
+
+Short reads only unless the pack was built with a long-read preset: k/w are baked into
+the .mmi and an index is only usable with a matching preset.
+EOF
+}
+
+# ==============================================================================
+case "${1:-}" in
+    pack)   shift; cmd_pack "$@" ;;
+    filter) shift; cmd_filter "$@" ;;
+    -h|--help|help|"") usage ;;
+    *)      die "unknown subcommand '$1' (expected pack or filter)" ;;
+esac
