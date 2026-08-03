@@ -27,11 +27,14 @@ union all
 
 -- ---- competitive mapping, one pass per class ----------------------------------
 -- MEASURED, so it is not a knob here: minimap2's high-occurrence minimizer mask (-f,
--- exposed as align_minimap2's occ_filter) changes NOTHING on this workload. Swept over
+-- exposed as align_minimap2's occ_filter) changes no VERDICT on this workload. Swept over
 -- 0.01 / 0.5 / 1000 / 100000 / '2000,10000' on 9,178 pairs against 890 target + 757 decoy
--- near-identical 16S: the unmeasured rate stayed at 0.09713 and the verdicts were
--- identical at every value. If the unmeasured rate is high on a dense reference set, the
--- lever is SEEDING (k/w at pack time), not masking -- see README.md.
+-- near-identical 16S: 0 of 45,890 per-pair verdicts changed and no setting reduced the
+-- unmeasured rate. It is not inert, though -- the two FRACTIONAL settings move the
+-- reject-reason attribution (197 pairs at 0.01, 155 at 0.5) and 0.5 raises the unmeasured
+-- rate slightly, 0.09713 -> 0.09719. So the claim is "no kept-or-removed decision changes
+-- and no measurement is recovered", not "nothing changes". If the unmeasured rate is high on
+-- a dense reference set, the lever is SEEDING (k/w at pack time), not masking -- see README.md.
 create or replace table rs_hit as
     select read_id as qkey, reference, tag_as as score, cigar
     from align_minimap2('rs_query', index_path := getvariable('rs_target_index'),

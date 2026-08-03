@@ -112,14 +112,24 @@ Each of these produced a wrong answer that looked right.
    This one is measured, and it is the opposite of what we assumed. minimap2's
    high-occurrence minimizer mask (`-f`) is a natural suspect on a dense, near-identical
    reference set, and it is **not** the cause. Swept over `0.01 / 0.5 / 1000 / 100000 /
-   '2000,10000'` on 9,178 pairs against 890 target + 757 decoy near-identical 16S
-   sequences, the unmeasured rate never moved off 0.09713 and the verdicts were identical
-   at every value — so readsieve deliberately exposes **no** flag for it. What does move it
-   is **k/w at pack time**. On 183 near-identical full-length sequences compared against
-   each other, unmeasured went 47.5% → 42.6% (k=15) → **16.4%** (k=11, w=5), tripling the
-   usable alignments, and those recovered alignments are real (median coverage 0.998,
-   identity 0.966) rather than short partial hits. Raising the occupancy limit on top of
-   fine seeding added exactly nothing.
+   '2000,10000'` on 9,178 pairs against 890 target + 757 decoy near-identical 16S sequences:
+   **not one of the 45,890 per-pair verdicts changed**, and no setting reduced the unmeasured
+   rate. So readsieve deliberately exposes **no** flag for it.
+
+   Be precise about what that does and does not say, because an earlier version of this
+   README overstated it. The parameter is *live*, not ignored: at the two **fractional**
+   settings — which minimap2 reads as a proportion to mask rather than an occurrence count —
+   the reject-reason attribution moves (197 pairs at `0.01`, 155 at `0.5`), and `0.5` nudges
+   the unmeasured rate the wrong way, 0.09713 → 0.09719. The three integer settings change
+   nothing at all. The claim is "masking changes no kept-or-removed decision and recovers no
+   measurement", not "masking changes nothing".
+
+   What does move the unmeasured rate is **k/w at pack time**. On 183 near-identical
+   full-length sequences compared against each other, unmeasured went 47.5% → 42.6% (k=15) →
+   **16.4%** (k=11, w=5), roughly tripling the usable alignments (487 → 1,460), and those
+   recovered alignments are real — median query coverage 0.998 at median identity 0.966 —
+   rather than short partial hits. Raising the occupancy limit on top of fine seeding added
+   exactly nothing.
 
 6. **k and w are baked into the `.mmi`.** An index only works with a preset whose k/w
    match, so `pack.tsv` records the preset and `filter` reads it from the pack rather than

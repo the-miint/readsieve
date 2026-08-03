@@ -438,11 +438,12 @@ Either mate positive drops the pair.
   --target-index / --decoy-index / --manifest / --preset   override pack contents
   --threads N / --max-memory SIZE                          [8] [12GB]
 
-There is deliberately no occupancy-mask (minimap2 -f) option: it was swept and changes
-nothing on this workload. If your unmeasured rate is high, rebuild the pack with a smaller
---k (see README.md).
   --no-keep-removed    do not write the removed reads (written by default: a filter
                        you cannot audit is a filter you cannot trust)
+
+There is deliberately no occupancy-mask (minimap2 -f) option: swept over five values, it
+changed 0 of 45,890 per-pair verdicts and reduced the unmeasured rate at none of them. If
+your unmeasured rate is high, rebuild the pack with a smaller --k (see README.md).
 
 Outputs, given --out-prefix P:
   P.kept[_R1/_R2].fastq.gz      reads that survive
