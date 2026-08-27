@@ -8,29 +8,62 @@
 -- ---- normalise, and reject what would silently corrupt a run -----------------
 -- ref_name is 'class|label|ref_id' and the CLASS IS READ OFF THIS NAME at filter time,
 -- never off which index a hit came from. That is what stops a run being silently wrong
--- when someone points both --target-index and --decoy-index at the same file. So the
--- separator must not appear inside a field.
+-- when someone points both --target-index and --decoy-index at the same file.
+--
+-- Only the FIRST field therefore has to be free of the separator, and it always is:
+-- class_not_target_or_decoy below leaves nothing but 'target' and 'decoy'. A '|' inside
+-- label or ref_id is harmless, because nothing splits those back out -- the filter joins
+-- the manifest on the whole ref_name and reads label and ref_id from their own columns.
+-- The one way a stray separator could do damage is by letting two references collide
+-- ('a|b' + 'c' and 'a' + 'b|c' concatenate alike), and ref_name_not_unique catches that.
+-- Banning '|' outright instead cost nothing on invented data and rejected every real
+-- record from sources that use it inside accessions, NCBI-style.
 create or replace table rs_ref as
 select class || '|' || label || '|' || ref_id as ref_name,
        ref_id, class, label, upper(sequence) as sequence, len(sequence) as length
 from rs_src;
 
+-- Each row carries what to DO about it: 'sequence_has_gap_or_space' names a symptom, and
+-- the operator staring at it still has to be told that their input is an alignment.
 create or replace table rs_reject as
-select 'class_not_target_or_decoy' as problem, count(*) as n from rs_ref
-    where class not in ('target', 'decoy')
-union all select 'ref_id_null_or_empty', count(*) from rs_ref
-    where ref_id is null or ref_id = ''
-union all select 'sequence_null_or_empty', count(*) from rs_ref
-    where sequence is null or length = 0
-union all select 'sequence_has_gap_or_space', count(*) from rs_ref
-    where regexp_matches(sequence, '[-. \t]')
-union all select 'pipe_in_id_or_label', count(*) from rs_ref
-    where contains(ref_id, '|') or contains(label, '|')
-union all select 'ref_name_not_unique', (select count(*) - count(distinct ref_name) from rs_ref)
-union all select 'no_target_sequences', (select (count(*) filter (where class='target') = 0)::int from rs_ref)
+select 'class_not_target_or_decoy' as problem, count(*) as n,
+       'class is neither --target-class nor --decoy-class; check --class-col' as remedy
+    from rs_ref where class not in ('target', 'decoy')
+union all select 'ref_id_null_or_empty', count(*),
+       'every reference needs an id; check --id-col, or the FASTA headers'
+    from rs_ref where ref_id is null or ref_id = ''
+union all select 'sequence_null_or_empty', count(*),
+       'empty sequences; drop them with --where, or fix the source'
+    from rs_ref where sequence is null or length = 0
+union all select 'sequence_has_gap_or_space', count(*),
+       'this is an ALIGNMENT, not sequences; degap it before packing'
+    from rs_ref where regexp_matches(sequence, '[-. \t]')
+union all select 'ref_name_not_unique',
+       (select count(*) - count(distinct ref_name) from rs_ref),
+       'two references share class+label+ref_id; ids must be unique within a class'
+union all select 'no_target_sequences',
+       (select (count(*) filter (where class='target') = 0)::int from rs_ref),
+       'nothing matched --target-class, so there would be nothing to detect'
 -- A pack with no decoys is the dangerous case, not an empty one: every competitive term
 -- would be skipped and every read that hits anything would be called positive.
-union all select 'no_decoy_sequences', (select (count(*) filter (where class='decoy') = 0)::int from rs_ref);
+union all select 'no_decoy_sequences',
+       (select (count(*) filter (where class='decoy') = 0)::int from rs_ref),
+       'nothing matched --decoy-class; with no decoy every hit is called positive';
+
+-- Nothing below this line runs when a reference would corrupt the pack, and nothing above
+-- it has written a file -- the indices are built by the next statement, and the driver's
+-- COPYs come later still. That ordering is what makes "nothing was written" true. It used
+-- to be checked by the driver AFTER the whole script had finished, which left a complete,
+-- usable-looking pack directory sitting next to the refusal to have built one.
+-- (`.bail on`, set by the driver, is what makes this stop the script rather than just
+-- print; the CLI otherwise carries on to the next statement.)
+-- The WHERE, not a CASE, is what keeps this silent: with nothing rejected it yields no
+-- rows, so error() is never reached and the statement prints nothing at all.
+select error(chr(10) || (select string_agg('  ' || problem || ' (' || n || ')' ||
+                                           chr(10) || '    ' || remedy,
+                                           chr(10) order by problem)
+                         from rs_reject where n > 0))
+where (select coalesce(sum(n), 0) from rs_reject) > 0;
 
 -- ---- the indices -------------------------------------------------------------
 -- One per class, and the filter maps against them separately. A single combined index

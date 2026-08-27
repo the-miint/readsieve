@@ -9,12 +9,11 @@
 # Run either subcommand with --help for its options. See README.md for the call, the
 # thresholds, and what each term is protecting against.
 #
-# Requires a duckdb-miint build. Set READSIEVE_DUCKDB, or leave it and the sibling
-# ../duckdb-miint/build/release/duckdb is used.
+# Requires DuckDB with the miint extension; ./install.sh sets both up. It is looked for in
+# $READSIEVE_DUCKDB, then ./bin/duckdb, then PATH, then a sibling ../duckdb-miint build.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DUCKDB="${READSIEVE_DUCKDB:-${ROOT%/*}/duckdb-miint/build/release/duckdb}"
 
 die()    { echo "readsieve: $*" >&2; exit 2; }
 is_int() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -gt 0 ]; }
@@ -24,8 +23,46 @@ is_num() { case "${1:-}" in ''|*[!0-9.]*|*.*.*) return 1 ;; esac; return 0; }
 # explicit cast, which fails loudly on garbage, but are checked here too for a clear error.
 is_mem()  { case "${1:-}" in ''|*[!0-9A-Za-z]*) return 1 ;; esac; return 0; }
 no_quote() { case "$1" in *"'"*) return 1 ;; esac; return 0; }
+# ---- run report ---------------------------------------------------------------------
+# Every line either command prints goes through these, so the sections line up with one
+# another and stay lined up as the numbers grow. The report is stdout; anything that went
+# wrong is stderr, so `readsieve filter ... > run.txt` keeps the report and still shows
+# failures on the terminal.
+RS_LBL=36           # label column
+RS_NUM=10           # right-aligned count column
 
-[ -x "$DUCKDB" ] || die "no duckdb-miint binary at $DUCKDB (set READSIEVE_DUCKDB)"
+rs_title()   { printf '\n%s\n' "$1"; }
+rs_field()   { printf '  %-12s%s\n' "$1" "$2"; }
+rs_cols()    { # section title, count-column header, [share-column header]
+    printf '\n%s\n' "$(printf '%-*s%*s%8s' "$((RS_LBL + 2))" "$1" "$RS_NUM" "$2" "${3-share}" \
+                       | sed 's/[[:space:]]*$//')"; }
+# Thousands separators: read counts run to eight digits and are unreadable without them.
+rs_int()     { awk -v x="$1" 'BEGIN{ s = sprintf("%d", x); r = "";
+                   while (length(s) > 3) { r = "," substr(s, length(s) - 2) r
+                                           s = substr(s, 1, length(s) - 3) }
+                   print s r }'; }
+rs_share()   { awk -v n="$1" -v d="$2" 'BEGIN{ if (d + 0 == 0) printf "%8s", ""
+                                               else printf "%7.1f%%", 100 * n / d }'; }
+rs_row()     { # label  count  [denominator for a share]  [trailing note]
+    printf '  %-*s%*s' "$RS_LBL" "$1" "$RS_NUM" "$(rs_int "$2")"
+    [ -n "${3:-}" ] && printf '%s' "$(rs_share "$2" "$3")"
+    [ -n "${4:-}" ] && printf '  %s' "$4"
+    printf '\n'
+}
+rs_text()    { printf '  %-*s%s\n' "$RS_LBL" "$1" "$2"; }   # label plus prose, no count
+
+# Records in a written output, for the post-run count check. FASTQ from this tool is
+# exactly four lines per record; FASTA may wrap the sequence over several lines, so its
+# headers are counted instead of its lines.
+n_records() { # $1 = format, $2 = path
+    case "$1" in
+        fastq) echo $(( $(zcat "$2" | wc -l) / 4 )) ;;
+        *)     zcat "$2" | grep -c '^>' || true ;;
+    esac
+}
+
+# Resolves $DUCKDB, defines the duckdb() wrapper, and checks that miint really loads.
+. "$ROOT/lib/duckdb.sh"
 
 usage() { sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; }
 
@@ -86,15 +123,16 @@ cmd_pack() {
         done
         # The zero-SQL path. ref_id is the FASTA id; label is the first word of the
         # description, which is the useful grouping for headers like ">acc Genus species".
-        # '|' is stripped rather than rejected because this label is DERIVED, not supplied.
+        # Neither is rewritten: '|' used to be stripped out of the label to keep ref_name
+        # parseable, and ref_name is no longer parsed past its first field.
         ID_COL="ref_id"; CLASS_COL="class"; SEQ_COL="sequence"; LABEL_EXPR="label"
         TARGET_CLASS="target"; DECOY_CLASS="decoy"
         FROM="(select read_id as ref_id, 'target' as class, sequence1 as sequence,
-                      replace(coalesce(nullif(split_part(comment,' ',1),''),'na'),'|','_') as label
+                      coalesce(nullif(split_part(comment,' ',1),''),'na') as label
                from read_fastx('$TARGET_FA')
                union all
                select read_id, 'decoy', sequence1,
-                      replace(coalesce(nullif(split_part(comment,' ',1),''),'na'),'|','_')
+                      coalesce(nullif(split_part(comment,' ',1),''),'na')
                from read_fastx('$DECOY_FA'))"
     elif [ -n "$SQLSRC" ]; then
         FROM="($SQLSRC)"
@@ -120,8 +158,24 @@ cmd_pack() {
     fi
 
     mkdir -p "$OUT"
-    echo ">>> packing: $OUT (preset=$PRESET)"
-    "$DUCKDB" -box <<SQL
+    printf 'readsieve pack\n'
+    if [ -n "$TARGET_FA" ]; then
+        rs_field target "$TARGET_FA"; rs_field decoy "$DECOY_FA"
+    else
+        rs_field source "${SRC:-<sql>}${TABLE:+ (table $TABLE)}"
+    fi
+    rs_field out "$OUT"
+    rs_field preset "$PRESET${K:+, k=$K}${W:+, w=$W}"
+
+    # The guard in pack.sql fires before anything is written, so on a refusal $OUT is still
+    # empty and is taken away again -- an empty pack directory left behind reads as a pack.
+    # The status is caught on the same line as the heredoc opener; anything after it there
+    # would be read as the first line of the SQL.
+    local rc=0
+    duckdb -noheader -list <<SQL || rc=$?
+-- Without this the CLI prints an error and runs the NEXT statement anyway, so a rejected
+-- reference set would still get its indices built and written.
+.bail on
 set threads=${THREADS};
 set max_memory='${MAX_MEM}';
 set variable rs_out    = '${OUT}';
@@ -147,21 +201,40 @@ where (${WHERE}) and ${CLASS_COL}::varchar in ('${TARGET_CLASS}', '${DECOY_CLASS
 copy (select * from rs_manifest) to '${OUT}/manifest.parquet' (format parquet, compression zstd);
 copy (select * from rs_packmeta) to '${OUT}/pack.tsv' (format csv, delimiter '\t', header true);
 
-select * from rs_reject where n > 0;
-select 'rejects_total' as k, coalesce(sum(n), 0)::varchar as v from rs_reject
-union all select 'targets', (select count(*) from rs_ref where class='target')::varchar
-union all select 'decoys',  (select count(*) from rs_ref where class='decoy')::varchar;
-copy (select coalesce(sum(n), 0) from rs_reject) to '${OUT}/reject_total.txt' (format csv, header false);
-select * from rs_index;
 SQL
+    if [ "$rc" != 0 ]; then
+        rmdir "$OUT" 2>/dev/null || true
+        die "pack: refused, see above -- nothing was written to $OUT"
+    fi
 
-    local bad; bad=$(cat "$OUT/reject_total.txt"); rm -f "$OUT/reject_total.txt"
-    [ "$bad" = "0" ] || die "pack: $bad reference(s) rejected -- see the table above; nothing usable was written"
+    # Reaching here means the guard in pack.sql passed and every COPY above ran, but the
+    # files are checked anyway: they are the deliverable, and a pack that is short one is
+    # worse than one that was never built, because it looks finished.
+    local f
     for f in target.mmi decoy.mmi manifest.parquet pack.tsv; do
         [ -s "$OUT/$f" ] || die "pack: $OUT/$f was not written"
     done
-    echo ">>> pack ready: $OUT"
-    column -t -s "$(printf '\t')" "$OUT/pack.tsv"
+
+    local -A P; local k v
+    while IFS=$'\t' read -r k v; do P[$k]=$v; done < <(tail -n +2 "$OUT/pack.tsv")
+    # An index holding fewer subjects than the class has references means minimap2 dropped
+    # some, and the filter would then measure against a reference set nobody asked for.
+    [ "${P[target_index_subjects]}" = "${P[n_target]}" ] \
+        || die "pack: target index holds ${P[target_index_subjects]} of ${P[n_target]} references"
+    [ "${P[decoy_index_subjects]}" = "${P[n_decoy]}" ] \
+        || die "pack: decoy index holds ${P[decoy_index_subjects]} of ${P[n_decoy]} references"
+
+    rs_cols references sequences ""
+    rs_row  target "${P[n_target]}"
+    rs_row  decoy  "${P[n_decoy]}"
+    rs_row  "median length" "${P[median_ref_length]}" "" "bp"
+
+    rs_title outputs
+    rs_row  "${OUT##*/}/target.mmi"       "${P[target_index_subjects]}" "" "subjects"
+    rs_row  "${OUT##*/}/decoy.mmi"        "${P[decoy_index_subjects]}"  "" "subjects"
+    rs_row  "${OUT##*/}/manifest.parquet" "$(( P[n_target] + P[n_decoy] ))" "" "references"
+    rs_text "${OUT##*/}/pack.tsv"         "the settings the indices were built with"
+    printf '\n'
 }
 
 pack_help() { cat <<'EOF'
@@ -197,9 +270,13 @@ Common:
   --threads N          duckdb threads                                  [8]
   --max-memory SIZE    duckdb memory ceiling                           [8GB]
 
+Writes PACK/target.mmi, PACK/decoy.mmi, PACK/manifest.parquet and PACK/pack.tsv. All four
+are needed; `filter --pack` reads the preset back out of pack.tsv.
+
 Rows whose class is neither target nor decoy are ignored. Anything that would make a run
-silently wrong -- a duplicate id, a '|' in an id or label, an empty sequence, a pack with
-only one class -- is rejected and no pack is written.
+silently wrong -- a duplicate id, an empty sequence, gapped (aligned) input, a pack with
+only one class -- is rejected BEFORE any index is built, so a refusal leaves nothing on
+disk. Each rejection names the fix.
 EOF
 }
 
@@ -247,9 +324,16 @@ cmd_filter() {
         : "${TARGET_INDEX:=$PACK/target.mmi}"
         : "${DECOY_INDEX:=$PACK/decoy.mmi}"
         : "${MANIFEST:=$PACK/manifest.parquet}"
+        # Checked before the awk below: on a directory that is not a pack, awk exits 2 with
+        # its complaint sent to /dev/null, and under `set -e` that killed the whole run
+        # with no output at all -- exit 2 and not one word about why.
+        [ -r "$PACK/pack.tsv" ] || die "filter: $PACK is not a readsieve pack -- no pack.tsv.
+  A pack comes from \`readsieve pack\` and holds target.mmi, decoy.mmi, manifest.parquet
+  and pack.tsv. For indices that are not laid out that way, name them individually with
+  --target-index/--decoy-index/--manifest instead of --pack."
         # k/w are baked into the .mmi, so an index is only usable with a preset whose k/w
         # match. Take the preset from the pack rather than defaulting and hoping.
-        [ -n "$PRESET" ] || PRESET=$(awk -F'\t' '$1=="preset"{print $2}' "$PACK/pack.tsv" 2>/dev/null)
+        [ -n "$PRESET" ] || PRESET=$(awk -F'\t' '$1=="preset"{print $2}' "$PACK/pack.tsv")
     fi
     : "${PRESET:=sr}"
     [ -n "$TARGET_INDEX" ] && [ -n "$DECOY_INDEX" ] && [ -n "$MANIFEST" ] \
@@ -263,28 +347,61 @@ cmd_filter() {
     export RS_MANIFEST="$MANIFEST" RS_MIN_IDENT="$MIN_IDENT" RS_MIN_COV="$MIN_COV"
     export RS_MIN_MARGIN="$MIN_MARGIN" RS_MAX_SEC="$MAX_SEC"
 
-    local READ_CALL KEPT_OUT REMOVED_OUT; local -a KEPT_FILES REMOVED_FILES
+    local READ_CALL KEPT_OUT REMOVED_OUT FMT; local -a KEPT_FILES REMOVED_FILES
     if [ -n "$R2" ]; then
         READ_CALL="read_fastx(getenv('RS_R1'), sequence2 := getenv('RS_R2'))"
-        KEPT_OUT="${PREFIX}.kept_{ORIENTATION}.fastq.gz"
-        REMOVED_OUT="${PREFIX}.removed_{ORIENTATION}.fastq.gz"
-        KEPT_FILES=("${PREFIX}.kept_R1.fastq.gz" "${PREFIX}.kept_R2.fastq.gz")
-        REMOVED_FILES=("${PREFIX}.removed_R1.fastq.gz" "${PREFIX}.removed_R2.fastq.gz")
     else
         READ_CALL="read_fastx(getenv('RS_R1'))"
-        KEPT_OUT="${PREFIX}.kept.fastq.gz"; REMOVED_OUT="${PREFIX}.removed.fastq.gz"
-        KEPT_FILES=("${PREFIX}.kept.fastq.gz"); REMOVED_FILES=("${PREFIX}.removed.fastq.gz")
     fi
-    # `overwrite true` is set on every FASTQ COPY, but the writer DROPS it when the path
+
+    # read_fastx takes FASTA and FASTQ alike, but the writer has to be told which to emit,
+    # and FASTA reads carry no qualities: aiming the FASTQ writer at them died on
+    # `NULL value in qual1 column (row 0)`, which names the symptom and not the cause. So
+    # ask the input what it is, and let that pick the writer and the extension both --
+    # inventing qualities to keep the output .fastq would be a worse answer than the error.
+    # LIMIT is pushed into the scan, so this costs a file open even on a 400 MB gzip.
+    # read_fastx refuses a FASTA/FASTQ mate pair itself, and says so more precisely than
+    # anything checked out here could, so its stderr is left alone to do the talking.
+    FMT=$(duckdb -noheader -list -c "select case when qual1 is null then 'fasta' else 'fastq' end
+              from ${READ_CALL} limit 1;") \
+        || die "filter: cannot read --r1 $R1${R2:+ / --r2 $R2} -- see the error above"
+    [ -n "$FMT" ] || die "filter: --r1 $R1 holds no sequence records"
+
+    if [ -n "$R2" ]; then
+        KEPT_OUT="${PREFIX}.kept_{ORIENTATION}.${FMT}.gz"
+        REMOVED_OUT="${PREFIX}.removed_{ORIENTATION}.${FMT}.gz"
+        KEPT_FILES=("${PREFIX}.kept_R1.${FMT}.gz" "${PREFIX}.kept_R2.${FMT}.gz")
+        REMOVED_FILES=("${PREFIX}.removed_R1.${FMT}.gz" "${PREFIX}.removed_R2.${FMT}.gz")
+    else
+        KEPT_OUT="${PREFIX}.kept.${FMT}.gz"; REMOVED_OUT="${PREFIX}.removed.${FMT}.gz"
+        KEPT_FILES=("${PREFIX}.kept.${FMT}.gz"); REMOVED_FILES=("${PREFIX}.removed.${FMT}.gz")
+    fi
+    # `overwrite true` is set on every sequence COPY, but the writer DROPS it when the path
     # contains {ORIENTATION} -- which is mandatory for paired output (duckdb-miint#201).
     # The expanded paths are only visible out here, so clear them from bash.
     rm -f "${KEPT_FILES[@]}" "${REMOVED_FILES[@]}"
 
-    echo ">>> filtering: r1=$R1 ${R2:+r2=$R2 }preset=$PRESET identity>=$MIN_IDENT coverage>=$MIN_COV margin>=$MIN_MARGIN"
+    # Printed before the mapping starts, so a long run says what it is doing rather than
+    # sitting silent, and so a run found later in a log identifies itself completely.
+    # Global, and trapped: a scratch file that outlives a failed run is litter, and the
+    # trap string is expanded when it fires, by which point a local would be gone.
+    RS_SCRATCH="tmp/rs_labels.$$.tsv"
+    trap 'rm -f "$RS_SCRATCH"' EXIT
+    local LABELS="$RS_SCRATCH"
+    printf 'readsieve filter\n'
+    rs_field reads "$R1"
+    [ -z "$R2" ] || rs_field "" "$R2"
+    rs_field pack "${PACK:-$TARGET_INDEX + $DECOY_INDEX}"
+    rs_field format "$FMT, $([ -n "$R2" ] && echo paired || echo single-end), preset $PRESET"
+    rs_field thresholds "identity>=$MIN_IDENT  coverage>=$MIN_COV  margin>=$MIN_MARGIN  secondary<=$MAX_SEC"
 
     # ONE process does mapping, outputs, summary and self-checks. Splitting the checks out
     # would re-map the whole sample just to re-materialise the tables.
-    "$DUCKDB" -box <<SQL
+    duckdb -noheader -list <<SQL || die "filter: mapping failed, see above -- outputs under $PREFIX are incomplete"
+-- See the note in cmd_pack: without this a failed statement only prints, and everything
+-- after it still runs. That is how a FASTQ COPY that died on a FASTA input still managed
+-- to print a full summary underneath its own error.
+.bail on
 set threads=${THREADS};
 set max_memory='${MAX_MEM}';
 set temp_directory='tmp/';
@@ -316,11 +433,11 @@ from rs_input i join rs_call c using (pair_ix);
 
 copy (select read_id, sequence1, sequence2, qual1, qual2 from rs_out
       where not is_positive order by pair_ix)
-  to '${KEPT_OUT}' (format fastq, overwrite true);
+  to '${KEPT_OUT}' (format ${FMT}, overwrite true);
 $( [ "$KEEP_REMOVED" = "1" ] && cat <<INNER
 copy (select read_id, sequence1, sequence2, qual1, qual2 from rs_out
       where is_positive order by pair_ix)
-  to '${REMOVED_OUT}' (format fastq, overwrite true);
+  to '${REMOVED_OUT}' (format ${FMT}, overwrite true);
 INNER
 )
 -- Every raw measurement, so thresholds can be re-swept without re-mapping.
@@ -382,41 +499,89 @@ union all select 'preset', getvariable('rs_preset');
 copy (select * from rs_summary) to '${PREFIX}.summary.tsv' (format csv, delimiter '\t', header true);
 copy (select * from rs_verify)  to '${PREFIX}.verify.tsv'  (format csv, delimiter '\t', header true);
 
-select * from rs_summary;
-select '--- self-checks ---';
-select * from rs_verify;
-select '--- what the removed reads matched ---';
-select * from rs_removed_labels order by pairs desc limit 15;
-
--- Written last so the driver can read one number out of it.
-copy (select coalesce(sum(violations),0) from rs_verify)
-  to '${PREFIX}.verify_total.txt' (format csv, header false);
+-- Nothing is SELECTed here on purpose. The driver renders the whole report from these
+-- files, so its layout is decided in one place instead of by duckdb's box writer, which
+-- turned every heading select into a boxed one-cell table. (No backticks in here: this
+-- heredoc is expanded by bash, and select is a shell keyword.) Scratch, not an
+-- output: the labels are a view of rs_call, which ships in full as calls.tsv.gz.
+copy (select label, pairs from rs_removed_labels order by pairs desc)
+  to '${LABELS}' (format csv, delimiter '\t', header false);
 SQL
 
-    echo ">>> verify"
-    local fail=0 viol; viol=$(cat "${PREFIX}.verify_total.txt")
-    printf '  self-checks: violations=%s\n' "$viol"
-    [ "$viol" = "0" ] || { echo "  FAIL: see ${PREFIX}.verify.tsv"; fail=1; }
+    # Everything below reads the files the run just wrote, so the report and the artifacts
+    # cannot disagree: if a number is on screen it is also on disk.
+    local -A M; local k v
+    while IFS=$'\t' read -r k v; do M[$k]=$v; done < <(tail -n +2 "${PREFIX}.summary.tsv")
+    local IN=${M[input_pairs]} POS=${M[positive_pairs]} KEPT=$(( M[input_pairs] - M[positive_pairs] ))
 
-    # Counted from the WRITTEN files, so this catches a truncated or unwritten output,
-    # which the SQL cannot see.
-    local want_kept want_removed got
-    want_kept=$(awk -F'\t' '$1=="input_pairs"{i=$2} $1=="positive_pairs"{p=$2} END{print i-p}' "${PREFIX}.summary.tsv")
-    want_removed=$(awk -F'\t' '$1=="positive_pairs"{print $2}' "${PREFIX}.summary.tsv")
+    rs_cols verdicts pairs
+    rs_row  removed "$POS" "$IN"
+    rs_row  kept    "$KEPT" "$IN"
+
+    # These partition the pairs -- 'called' is itself a reject_reason -- so the column
+    # sums to the input, and that is the point of showing them together.
+    rs_cols "why each pair landed there" pairs
+    rs_row  "called (removed)"  "$POS" "$IN"
+    for k in unmapped no_target_hit tied_with_decoy decoy_won thin_margin below_threshold; do
+        rs_row "$k" "${M[reject_$k]}" "$IN"
+    done
+
+    # Which references the removed reads matched. Everything stripped landing on one label
+    # is the signal that something is wrong with the pack, so it is reported by default.
+    if [ -s "$LABELS" ]; then
+        rs_cols "what the removed reads matched" pairs
+        head -n 15 "$LABELS" | while IFS=$'\t' read -r k v; do rs_row "$k" "$v" "$POS"; done
+        local extra=$(( $(wc -l < "$LABELS") - 15 ))
+        [ "$extra" -gt 0 ] && rs_text "" "... and $extra more, in ${PREFIX##*/}.calls.tsv.gz"
+    fi
+
+    # The measurements the verdicts rest on. Unmeasured mates are the one number here that
+    # can invalidate a run: they are not evidence of a negative, so a high share means the
+    # negative calls are unsupported rather than confirmed.
+    rs_title evidence
+    rs_row  "median read length"        "${M[median_read_length]}"
+    rs_row  "mate queries"              "${M[mate_queries]}"
+    rs_row  "mates with an alignment"   "${M[mates_with_any_alignment]}" "${M[mate_queries]}"
+    rs_row  "mates unmeasured"          "${M[mates_unmeasured]}" "${M[mate_queries]}" \
+            "not evidence of a negative"
+    rs_row  "removed with no decoy measured" "${M[positive_no_decoy_measured]}" "$POS" \
+            "identity and coverage only"
+    if [ -n "$R2" ]; then
+        rs_row "removed on R1 only"     "${M[positive_r1_only]}" "$POS"
+        rs_row "removed on R2 only"     "${M[positive_r2_only]}" "$POS"
+        rs_row "removed on both mates"  "${M[positive_both_mates]}" "$POS"
+    fi
+
+    # ---- self-checks and the written files ----
+    local fail=0 checks viol
+    checks=$(awk -F'\t' 'NR>1{n++} END{print n+0}' "${PREFIX}.verify.tsv")
+    viol=$(awk -F'\t' 'NR>1{s+=$2} END{print s+0}' "${PREFIX}.verify.tsv")
+    rs_title self-checks
+    rs_row "checks run"  "$checks"
+    rs_row "violations"  "$viol"
+    [ "$viol" = "0" ] || { rs_text "" "see ${PREFIX##*/}.verify.tsv for which"; fail=1; }
+
+    # Record counts come from the WRITTEN files, which is what catches an output that was
+    # truncated or never written at all -- something the SQL above cannot see.
+    local want_kept=$KEPT want_removed=$POS got f
+    rs_title outputs
     for f in "${KEPT_FILES[@]}"; do
-        got=$(( $(zcat "$f" | wc -l) / 4 ))
-        printf '  %-40s records=%s want=%s\n' "$(basename "$f")" "$got" "$want_kept"
-        [ "$got" = "$want_kept" ] || { echo "  FAIL: $f != kept verdicts"; fail=1; }
+        got=$(n_records "$FMT" "$f")
+        rs_row "${f##*/}" "$got" "" "records"
+        [ "$got" = "$want_kept" ] || { rs_text "" "FAIL: expected $want_kept kept"; fail=1; }
     done
     if [ "$KEEP_REMOVED" = "1" ]; then
         for f in "${REMOVED_FILES[@]}"; do
-            got=$(( $(zcat "$f" | wc -l) / 4 ))
-            printf '  %-40s records=%s want=%s\n' "$(basename "$f")" "$got" "$want_removed"
-            [ "$got" = "$want_removed" ] || { echo "  FAIL: $f != positive verdicts"; fail=1; }
+            got=$(n_records "$FMT" "$f")
+            rs_row "${f##*/}" "$got" "" "records"
+            [ "$got" = "$want_removed" ] || { rs_text "" "FAIL: expected $want_removed removed"; fail=1; }
         done
     fi
-    [ "$fail" = "0" ] || exit 1
-    echo "READSIEVE_FILTER_OK"
+    rs_text "${PREFIX##*/}.calls.tsv.gz"   "per-pair verdict and every raw measurement"
+    rs_text "${PREFIX##*/}.summary.tsv"    "the numbers above"
+    rs_text "${PREFIX##*/}.verify.tsv"     "self-check detail"
+    printf '\n'
+    [ "$fail" = "0" ] || die "filter: run finished with failures -- see above"
 }
 
 filter_help() { cat <<'EOF'
@@ -427,7 +592,8 @@ Either mate positive drops the pair.
 
   --pack DIR           pack from `readsieve pack`; supplies both indices, the
                        manifest, and the preset the indices were built with
-  --r1 / --r2 PATH     input FASTQ (gz ok); omit --r2 for single-end
+  --r1 / --r2 PATH     input FASTQ or FASTA (gz ok); omit --r2 for single-end.
+                       The outputs come back in whichever format went in
   --out-prefix P       output prefix                                   [required]
   --min-identity F     identity floor for the winning target hit       [0.95]
   --min-coverage F     query-coverage floor for that hit               [0.90]
@@ -445,7 +611,7 @@ There is deliberately no occupancy-mask (minimap2 -f) option: swept over five va
 changed 0 of 45,890 per-pair verdicts and reduced the unmeasured rate at none of them. If
 your unmeasured rate is high, rebuild the pack with a smaller --k (see README.md).
 
-Outputs, given --out-prefix P:
+Outputs, given --out-prefix P (.fastq.gz shown; FASTA in means .fasta.gz out):
   P.kept[_R1/_R2].fastq.gz      reads that survive
   P.removed[_R1/_R2].fastq.gz   reads removed
   P.calls.tsv.gz                per-pair verdict AND every raw measurement

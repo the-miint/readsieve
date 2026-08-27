@@ -1,6 +1,10 @@
 # Working directory: packs, indices, filtered reads, smoke-test scratch.
 tmp/
 
+# install.sh: the DuckDB CLI it fetches, and its download scratch dir.
+bin/
+.install.*
+
 # Reference packs and their artifacts, wherever they land. Data is never committed.
 *.mmi
 *.fasta
@@ -11,6 +15,8 @@ tmp/
 *.fastq.gz
 *.parquet
 *.calls.tsv.gz
+*.summary.tsv
+*.verify.tsv
 manifest.parquet
 pack.tsv
 

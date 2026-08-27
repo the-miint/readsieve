@@ -1,4 +1,7 @@
-# readsieve
+<p align="center">
+  <img src="docs/readsieve-logo.png" width="330"
+       alt="readsieve — target · decoy · DNA filtering">
+</p>
 
 Competitive-mapping read filter. You give it two sets of reference sequences — **target**
 and **decoy** — and it removes read pairs that clearly look more like target than decoy.
@@ -6,8 +9,38 @@ and **decoy** — and it removes read pairs that clearly look more like target t
 It does not know what the two sets mean. Chloroplast vs cyanobacteria, host vs microbiome,
 vector vs insert, one species vs its sister group: same tool, different pack.
 
-Bash plus a [duckdb-miint](https://github.com/the-miint/duckdb-miint) build. No Python, no
-conda, no pipeline framework, and no SQL required to use it.
+Bash plus DuckDB with the [miint](https://github.com/the-miint/duckdb-miint) extension. No
+Python, no conda, no pipeline framework, and no SQL required to use it.
+
+## Install
+
+```bash
+./install.sh
+```
+
+That is the whole dependency setup. It fetches the DuckDB v1.5.4 CLI into `./bin/duckdb`
+and installs `miint` into it from `https://ftp.microbio.me/pub/miint`, then checks that the
+functions readsieve calls are actually there. It is idempotent, so re-running it is cheap,
+and `DUCKDB_DEST=~/.local/bin ./install.sh` puts the CLI somewhere else.
+
+You do not have to use it. readsieve takes the first working duckdb it finds, in order:
+
+| candidate | what it is |
+|---|---|
+| `$READSIEVE_DUCKDB` | an explicit path; never silently overridden |
+| `./bin/duckdb` | where `install.sh` puts it |
+| `duckdb` on `PATH` | any stock CLI that has `miint` installed |
+| `../duckdb-miint/build/release/duckdb` | a sibling source build, extension linked in |
+
+A stock CLI plus the published extension and a duckdb-miint source build are equivalent
+here — the same pack and the same filter come out of both. Whichever it picks, readsieve
+verifies up front that `miint` loads and provides the functions it needs, so a missing or
+outdated dependency fails immediately with a message that names the fix, rather than as a
+SQL error partway through a run.
+
+Intel Macs are not supported: `miint` publishes `linux_amd64`, `linux_arm64` and
+`osx_arm64` builds, and `install.sh` says so rather than downloading a CLI that cannot
+load it.
 
 ## Quick start
 
@@ -122,24 +155,122 @@ Each of these produced a wrong answer that looked right.
 
 ## Outputs
 
-Given `--out-prefix P`:
+`pack --out PACK` writes four files, and all four are needed:
+
+| file | what |
+|---|---|
+| `PACK/target.mmi` | minimap2 index over the target class |
+| `PACK/decoy.mmi` | minimap2 index over the decoy class |
+| `PACK/manifest.parquet` | one row per reference: `ref_name`, `class`, `ref_id`, `label`, `length`. Every reference name a run can emit has to resolve here, and `filter` asserts it |
+| `PACK/pack.tsv` | the settings the indices were built with — preset, k, w, counts, median length. `filter` reads the preset back out of this, because k and w are baked into the `.mmi` and an index is only usable with a preset whose k and w match |
+
+`filter --out-prefix P` writes five:
 
 | file | what |
 |---|---|
 | `P.kept[_R1/_R2].fastq.gz` | reads that survive |
-| `P.removed[_R1/_R2].fastq.gz` | reads removed (written by default — a filter you cannot audit is a filter you cannot trust) |
-| `P.calls.tsv.gz` | per-pair verdict **and every raw measurement** |
-| `P.summary.tsv` | the numbers, also printed |
-| `P.verify.tsv` | self-checks, PASS/FAIL per row |
+| `P.removed[_R1/_R2].fastq.gz` | reads removed (written by default — a filter you cannot audit is a filter you cannot trust); suppress with `--no-keep-removed` |
+| `P.calls.tsv.gz` | one row per pair: the verdict, the reject reason, **and every raw measurement behind it** — per-mate target and decoy reference, score, identity and coverage. This is the file to re-sweep thresholds against without re-mapping |
+| `P.summary.tsv` | every number the run printed, as `metric`/`value` |
+| `P.verify.tsv` | self-checks, one row each with a violation count |
 
-Reject reasons partition the pairs, so the buckets sum to the input: `unmapped` ·
-`no_target_hit` · `decoy_won` · `tied_with_decoy` · `thin_margin` · `below_threshold` ·
-`called`. Ties are counted separately because they are a real cost, not a rounding detail.
+Reads go in as FASTQ or FASTA (gzipped or not) and come back out in the same format, so a
+FASTA sample yields `P.kept.fasta.gz`. Qualities are carried through untouched; nothing
+downstream of the mapper reads them, and the smoke test asserts that the same reads as
+FASTA and as FASTQ produce identical verdicts.
 
-The self-checks run in the same process as the work, and the driver exits non-zero on any
-violation. They are written so they can actually fail — a row-count comparison between
+Nothing else is left behind. Both subcommands write only the files above; `filter` uses
+`tmp/` for DuckDB spill and one scratch file, and removes the scratch file even when the
+run fails.
+
+### What a run prints
+
+The report goes to **stdout** and everything that went wrong goes to **stderr**, so
+`readsieve filter … > run.txt` keeps the report and still shows failures on the terminal.
+Both subcommands print the same shape: what they were given, then what came of it.
+
+```
+readsieve filter
+  reads       sampleA_R1.fastq.gz
+              sampleA_R2.fastq.gz
+  pack        chloro_pack
+  format      fastq, paired, preset sr
+  thresholds  identity>=0.95  coverage>=0.90  margin>=0.20  secondary<=5
+
+verdicts                                   pairs   share
+  removed                                    720   33.3%
+  kept                                     1,440   66.7%
+
+why each pair landed there                 pairs   share
+  called (removed)                           720   33.3%
+  unmapped                                   720   33.3%
+  no_target_hit                              720   33.3%
+  tied_with_decoy                              0    0.0%
+  decoy_won                                    0    0.0%
+  thin_margin                                  0    0.0%
+  below_threshold                              0    0.0%
+
+what the removed reads matched             pairs   share
+  Oryza                                      720  100.0%
+
+evidence
+  median read length                         150
+  mate queries                             4,320
+  mates with an alignment                  2,880   66.7%
+  mates unmeasured                         1,440   33.3%  not evidence of a negative
+  removed with no decoy measured             720  100.0%  identity and coverage only
+  removed on R1 only                           0    0.0%
+  removed on R2 only                           0    0.0%
+  removed on both mates                      720  100.0%
+
+self-checks
+  checks run                                  12
+  violations                                   0
+
+outputs
+  sampleA.kept_R1.fastq.gz                 1,440  records
+  …
+```
+
+Four of those sections are worth reading closely:
+
+**why each pair landed there.** The reject reasons partition the pairs, so the column sums
+to the input: `called` · `unmapped` · `no_target_hit` · `decoy_won` · `tied_with_decoy` ·
+`thin_margin` · `below_threshold`. Ties are counted separately because they are a real
+cost, not a rounding detail.
+
+**what the removed reads matched.** The labels the removed reads hit, largest first. This
+is how you notice that everything you stripped came from a single reference — the top 15
+are shown, and the rest are in `P.calls.tsv.gz`.
+
+**evidence.** `mates unmeasured` is the one number here that can invalidate a run. An
+unmeasured mate is not evidence of a negative, so a high share means the negative calls are
+unsupported rather than confirmed; rebuild the pack with a smaller `--k` if it is high.
+`removed with no decoy measured` counts positives whose competitive term was skipped
+because no decoy aligned at all — for those reads the call rests on identity and coverage
+alone, which is usually a large minority and is reported rather than hidden.
+
+**self-checks.** These run in the same process as the work, and the run exits non-zero on
+any violation. They are written so they can actually fail — a row-count comparison between
 input and output, for instance, is deliberately absent because it is equal by construction
-and could never catch anything.
+and could never catch anything. The record counts under `outputs` are read back off the
+*written* files, which is what catches an output that was truncated or never written.
+
+### When something is wrong
+
+`pack` validates the reference set before it builds anything, and a refusal names both the
+problem and the fix:
+
+```
+Invalid Input Error:
+  sequence_has_gap_or_space (1)
+    this is an ALIGNMENT, not sequences; degap it before packing
+readsieve: pack: refused, see above -- nothing was written to mypack
+```
+
+That check runs ahead of the index build, so "nothing was written" is literal: no
+half-built pack is left on disk, and an output directory created for the attempt is removed
+again. A pack directory that exists is a pack directory that was finished.
 
 ## Test
 

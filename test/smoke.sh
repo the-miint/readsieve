@@ -16,13 +16,16 @@
 # bounds below are loose on recall and tight on the two error rates.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DUCKDB="${READSIEVE_DUCKDB:-${ROOT%/*}/duckdb-miint/build/release/duckdb}"
+# Resolves the duckdb binary, defines the duckdb() wrapper, and checks that miint really
+# loads -- before the workdir is cleared, so a missing dependency costs nothing. Exported
+# so the readsieve runs below use this exact binary rather than resolving one of their own.
+. "$ROOT/lib/duckdb.sh"
+export READSIEVE_DUCKDB="$DUCKDB"
 WORK="${1:-$ROOT/tmp/smoke}"
 rm -rf "$WORK"; mkdir -p "$WORK"
-[ -x "$DUCKDB" ] || { echo "smoke: no duckdb-miint at $DUCKDB" >&2; exit 2; }
 
 echo ">>> generating a synthetic reference set and reads"
-"$DUCKDB" -box <<SQL
+duckdb -box <<SQL
 set threads=4;
 set preserve_insertion_order=true;
 
@@ -101,7 +104,7 @@ bash "$ROOT/readsieve" filter --pack "$WORK/pack" \
 
 echo
 echo ">>> confusion matrix by truth class"
-"$DUCKDB" -box <<SQL
+duckdb -box <<SQL
 create or replace view c as
 select split_part(read_id, '_', 1) as truth, is_positive::boolean as pos
 from read_csv('${WORK}/out.calls.tsv.gz', delim='\t', header=true);
@@ -112,7 +115,7 @@ SQL
 
 echo
 echo ">>> asserted bounds"
-rate() { "$DUCKDB" -noheader -list -c "
+rate() { duckdb -noheader -list -c "
 select coalesce(round(count(*) filter (where is_positive::boolean)::double / nullif(count(*),0), 4), -1)
 from read_csv('${WORK}/out.calls.tsv.gz', delim='\t', header=true)
 where split_part(read_id, '_', 1) = '$1';"; }
@@ -135,6 +138,27 @@ check outgroup "$(rate outgroup)" "==" 0
 
 viol=$(awk -F'\t' 'NR>1{s+=$2} END{print s+0}' "$WORK/out.verify.tsv")
 check verify "$viol" "==" 0
+
+# FASTA in, FASTA out. Qualities are the only thing that changes, and nothing downstream
+# of the mapper reads them, so every verdict must survive the round trip unchanged -- and
+# the outputs must come back as .fasta.gz rather than as an unwritable .fastq.gz.
+echo
+echo ">>> same reads as FASTA"
+for o in R1 R2; do
+    duckdb -c "copy (select read_id, sequence1 from read_fastx('${WORK}/reads_${o}.fastq.gz'))
+               to '${WORK}/reads_${o}.fasta.gz' (format fasta, overwrite true);"
+done
+bash "$ROOT/readsieve" filter --pack "$WORK/pack" \
+    --r1 "$WORK/reads_R1.fasta.gz" --r2 "$WORK/reads_R2.fasta.gz" \
+    --out-prefix "$WORK/fa" --threads 4 | tail -6
+for f in kept_R1 kept_R2 removed_R1 removed_R2; do
+    [ -s "$WORK/fa.${f}.fasta.gz" ] || { echo "  MISSING: fa.${f}.fasta.gz"; fail=1; }
+done
+disagree=$(duckdb -noheader -list -c "
+select count(*) filter (where a.is_positive is distinct from b.is_positive)
+from read_csv('${WORK}/out.calls.tsv.gz', delim='\t', header=true) a
+join read_csv('${WORK}/fa.calls.tsv.gz', delim='\t', header=true) b using (read_id);")
+check fasta_calls "$disagree" "==" 0
 
 [ "$fail" = "0" ] || { echo "SMOKE FAILED"; exit 1; }
 echo "SMOKE PASSED"
