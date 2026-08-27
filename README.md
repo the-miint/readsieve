@@ -6,7 +6,7 @@ and **decoy** — and it removes read pairs that clearly look more like target t
 It does not know what the two sets mean. Chloroplast vs cyanobacteria, host vs microbiome,
 vector vs insert, one species vs its sister group: same tool, different pack.
 
-Bash plus a [duckdb-miint](https://github.com/wasade/duckdb-miint) build. No Python, no
+Bash plus a [duckdb-miint](https://github.com/the-miint/duckdb-miint) build. No Python, no
 conda, no pipeline framework, and no SQL required to use it.
 
 ## Quick start
@@ -29,7 +29,7 @@ you stripped came from one reference.
 
 ## Other input formats
 
-If your references already live in a table, point at it and name the columns — still no SQL:
+If your references already live in a table, point at it and name the columns:
 
 ```bash
 readsieve pack --source refs.parquet --out mypack \
@@ -44,7 +44,7 @@ and `--where` can narrow the source further.
 There is also `--source-sql` for arbitrary queries, if you want to join or filter something
 complicated on the way in. You never need it for normal use.
 
-**Which references deserve to be in the pack is your decision, not the tool's.** That is a
+**Which references deserve to be in the pack is your decision.** That is a
 question about your data and your risk tolerance, so it belongs in how you prepare the
 input, not in here.
 
@@ -78,16 +78,15 @@ What each term is for:
 - **The margin is relative, not absolute.** minimap2's alignment score scales with read
   length, so a fixed margin silently loosens as reads get longer.
 
-## Six things that will bite you
+## Six things to watch out for
 
 Each of these produced a wrong answer that looked right.
 
-1. **Unmapped is not negative evidence.** minimap2 emits no row for a query it cannot
-   align, so "no hit" means *not measured*, not *distant*. A missing measurement read as a
+1. **Unmapped is not negative evidence.** "no hit" means *not measured*, not *distant*. A missing measurement read as a
    confident zero inverts the safe default. `mates_unmeasured_frac` is in the summary for
    this reason: a high value invalidates the negative calls rather than confirming them.
 
-2. **A null decoy score SKIPS the competitive terms, it does not fail them.** For those
+2. **A null decoy score SKIPS the competitive terms** For those
    reads the call is identity + coverage only. This is deliberate — it keeps genuinely
    divergent target reads from being silently discarded — but it is usually a large
    minority of positives, not an edge case, so `positive_no_decoy_measured` is reported.
@@ -102,34 +101,18 @@ Each of these produced a wrong answer that looked right.
    from distance. Two passes cost the same total work and give a per-class best for every
    read, so the margin is always a measured number.
 
-4. **Class comes from the reference name, never from which pass found it.** Names are
+4. **Class comes from the reference name.** Names are
    `class|label|id` and the filter parses the class out. Deriving it from the pass would
    make everything silently wrong the moment someone pointed both indices at the same file.
    `pack` rejects a `|` in any id or label for this reason, and the filter asserts that
    every name it emits resolves in the manifest.
 
-5. **If your unmeasured rate is high, the lever is seeding — not occupancy masking.**
-   This one is measured, and it is the opposite of what we assumed. minimap2's
-   high-occurrence minimizer mask (`-f`) is a natural suspect on a dense, near-identical
-   reference set, and it is **not** the cause. Swept over `0.01 / 0.5 / 1000 / 100000 /
-   '2000,10000'` on 9,178 pairs against 890 target + 757 decoy near-identical 16S sequences:
-   **not one of the 45,890 per-pair verdicts changed**, and no setting reduced the unmeasured
-   rate. So readsieve deliberately exposes **no** flag for it.
-
-   Be precise about what that does and does not say, because an earlier version of this
-   README overstated it. The parameter is *live*, not ignored: at the two **fractional**
-   settings — which minimap2 reads as a proportion to mask rather than an occurrence count —
-   the reject-reason attribution moves (197 pairs at `0.01`, 155 at `0.5`), and `0.5` nudges
-   the unmeasured rate the wrong way, 0.09713 → 0.09719. The three integer settings change
-   nothing at all. The claim is "masking changes no kept-or-removed decision and recovers no
-   measurement", not "masking changes nothing".
-
-   What does move the unmeasured rate is **k/w at pack time**. On 183 near-identical
-   full-length sequences compared against each other, unmeasured went 47.5% → 42.6% (k=15) →
+5. **If your unmeasured rate is high, consider minimap2 k/w parameters at packing.**
+   On 183 near-identical full-length sequences compared against each other, unmeasured went 47.5% → 42.6% (k=15) →
    **16.4%** (k=11, w=5), roughly tripling the usable alignments (487 → 1,460), and those
    recovered alignments are real — median query coverage 0.998 at median identity 0.966 —
    rather than short partial hits. Raising the occupancy limit on top of fine seeding added
-   exactly nothing.
+   nothing.
 
 6. **k and w are baked into the `.mmi`.** An index only works with a preset whose k/w
    match, so `pack.tsv` records the preset and `filter` reads it from the pack rather than
